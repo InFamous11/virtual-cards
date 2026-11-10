@@ -22,8 +22,8 @@ bind_interrupts!(struct Irqs {
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
 });
 
-const WIFI_NETWORK: &str = "WiFi3567ywx";
-const WIFI_PASSWORD: &str = "Da2dEq7JF";
+const WIFI_NETWORK: &str = env!("SSID");
+const WIFI_PASSWORD: &str = env!("PASSWORD");
 
 mod server;
 mod wifi;
