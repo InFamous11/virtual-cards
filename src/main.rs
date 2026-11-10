@@ -1,125 +1,81 @@
-//! SPDX-License-Identifier: MIT OR Apache-2.0
-//!
-//! Copyright (c) 2021–2024 The rp-rs Developers
-//! Copyright (c) 2021 rp-rs organization
-//! Copyright (c) 2025 Raspberry Pi Ltd.
-//!
-//! # GPIO 'Blinky' Example
-//!
-//! This application demonstrates how to control a GPIO pin on the rp2040 and rp235x.
-//!
-//! It may need to be adapted to your particular board layout and/or pin assignment.
-
 #![no_std]
 #![no_main]
 
+use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use defmt::*;
-use defmt_rtt as _;
-use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::OutputPin;
-#[cfg(target_arch = "riscv32")]
-use panic_halt as _;
-#[cfg(target_arch = "arm")]
-use panic_probe as _;
+use embassy_executor::Spawner;
+use embassy_rp::gpio::{Level, Output};
+use embassy_rp::peripherals::{DMA_CH0, PIO0};
+use embassy_rp::pio::{InterruptHandler, Pio};
+use embassy_rp::{bind_interrupts, dma};
+use embassy_time::{Duration, Timer};
+use static_cell::StaticCell;
+use {defmt_rtt as _, panic_probe as _};
 
-// Alias for our HAL crate
-use hal::entry;
+bind_interrupts!(struct Irqs {
+    PIO0_IRQ_0 => InterruptHandler<PIO0>;
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
+});
 
-#[cfg(rp2350)]
-use rp235x_hal as hal;
-
-#[cfg(rp2040)]
-use rp2040_hal as hal;
-
-// use bsp::entry;
-// use bsp::hal;
-// use rp_pico as bsp;
-
-/// The linker will place this boot block at the start of our program image. We
-/// need this to help the ROM bootloader get our code up and running.
-/// Note: This boot block is not necessary when using a rp-hal based BSP
-/// as the BSPs already perform this step.
-#[unsafe(link_section = ".boot2")]
-#[used]
-#[cfg(rp2040)]
-pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
-
-/// Tell the Boot ROM about our application
-#[unsafe(link_section = ".start_block")]
-#[used]
-#[cfg(rp2350)]
-pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
-
-/// External high-speed crystal on the Raspberry Pi Pico 2 board is 12 MHz.
-/// Adjust if your board has a different frequency
-const XTAL_FREQ_HZ: u32 = 12_000_000u32;
-
-/// Entry point to our bare-metal application.
-///
-/// The `#[hal::entry]` macro ensures the Cortex-M start-up code calls this function
-/// as soon as all global variables and the spinlock are initialised.
-///
-/// The function configures the rp2040 and rp235x peripherals, then toggles a GPIO pin in
-/// an infinite loop. If there is an LED connected to that pin, it will blink.
-#[entry]
-fn main() -> ! {
-    info!("Program start");
-    // Grab our singleton objects
-    let mut pac = hal::pac::Peripherals::take().unwrap();
-
-    // Set up the watchdog driver - needed by the clock setup code
-    let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
-
-    // Configure the clocks
-    let clocks = hal::clocks::init_clocks_and_plls(
-        XTAL_FREQ_HZ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut pac.RESETS,
-        &mut watchdog,
-    )
-    .unwrap();
-
-    #[cfg(rp2040)]
-    let mut timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
-
-    #[cfg(rp2350)]
-    let mut timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
-
-    // The single-cycle I/O block controls our GPIO pins
-    let sio = hal::Sio::new(pac.SIO);
-
-    // Set the pins to their default state
-    let pins = hal::gpio::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
-
-    // Configure GPIO25 as an output
-    let mut led_pin = pins.gpio25.into_push_pull_output();
-    loop {
-        info!("on!");
-        led_pin.set_high().unwrap();
-        timer.delay_ms(200);
-        info!("off!");
-        led_pin.set_low().unwrap();
-        timer.delay_ms(200);
-    }
+#[embassy_executor::task]
+async fn cyw43_task(
+    runner: cyw43::Runner<
+        'static,
+        cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>,
+        // cyw43::Cyw43439,
+    >,
+) -> ! {
+    runner.run().await
 }
 
-/// Program metadata for `picotool info`
-#[unsafe(link_section = ".bi_entries")]
-#[used]
-pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 5] = [
-    hal::binary_info::rp_cargo_bin_name!(),
-    hal::binary_info::rp_cargo_version!(),
-    hal::binary_info::rp_program_description!(c"Blinky Example"),
-    hal::binary_info::rp_cargo_homepage_url!(),
-    hal::binary_info::rp_program_build_attribute!(),
-];
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let p = embassy_rp::init(Default::default());
 
-// End of file
+    let fw = cyw43::aligned_bytes!("../firmware/43439A0.bin");
+    let clm = cyw43::aligned_bytes!("../firmware/43439A0_clm.bin");
+    let nvram = cyw43::aligned_bytes!("../firmware/nvram_rp2040.bin");
+
+    // To make flashing faster for development, you may want to flash the firmwares independently
+    // at hardcoded addresses, instead of baking them into the program with `include_bytes!`:
+    //     probe-rs download ../../cyw43-firmware/43439A0.bin --binary-format bin --chip RP2040 --base-address 0x10100000
+    //     probe-rs download ../../cyw43-firmware/43439A0_clm.bin --binary-format bin --chip RP2040 --base-address 0x10140000
+    //let fw = unsafe { core::slice::from_raw_parts(0x10100000 as *const u8, 230321) };
+    //let clm = unsafe { core::slice::from_raw_parts(0x10140000 as *const u8, 4752) };
+
+    let pwr = Output::new(p.PIN_23, Level::Low);
+    let cs = Output::new(p.PIN_25, Level::High);
+    let mut pio = Pio::new(p.PIO0, Irqs);
+    let spi = PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        DEFAULT_CLOCK_DIVIDER,
+        pio.irq0,
+        cs,
+        p.PIN_24,
+        p.PIN_29,
+        dma::Channel::new(p.DMA_CH0, Irqs),
+    );
+
+    static STATE: StaticCell<cyw43::State> = StaticCell::new();
+    let state = STATE.init(cyw43::State::new());
+    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+
+    spawner.spawn(unwrap!(cyw43_task(runner)));
+
+    control.init(clm).await;
+    control
+        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .await;
+
+    let delay = Duration::from_secs(1);
+    loop {
+        info!("led on!");
+        control.gpio_set(0, true).await;
+        Timer::after(delay).await;
+
+        info!("led off!");
+        control.gpio_set(0, false).await;
+        Timer::after(delay).await;
+    }
+}
